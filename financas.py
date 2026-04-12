@@ -155,10 +155,18 @@ def inject_css() -> None:
             box-shadow: 0 0 0 2px rgba(47, 125, 74, 0.10) !important;
             background: #FFFFFF !important;
         }
+        .stSelectbox [data-baseweb="select"] > div {
+            background: linear-gradient(180deg, #FFFFFF 0%, #F8FBF8 100%) !important;
+        }
         .stSelectbox [data-baseweb="select"] > div > div,
         .stSelectbox [data-baseweb="select"] input,
         .stSelectbox [data-baseweb="select"] span {
             color: var(--ink) !important;
+            font-weight: 700 !important;
+        }
+        .stSelectbox [data-baseweb="select"] [aria-hidden="true"] {
+            color: var(--primary-strong) !important;
+            font-weight: 700 !important;
         }
         [data-baseweb="select"] svg,
         [data-testid="stDateInput"] svg {
@@ -553,19 +561,32 @@ def format_date_br(value: str | date | datetime | pd.Timestamp | None) -> str:
 
 
 def format_atm_digits(digits: str) -> str:
-    if not digits:
+    normalized_digits = re.sub(r"\D", "", str(digits or "")).lstrip("0")
+    if not normalized_digits:
         return ""
-    return decimal_brl(int(digits) / 100)
+    return decimal_brl(int(normalized_digits) / 100)
 
 
 def prepare_atm_widget_state(key: str) -> None:
     widget_key = f"{key}_widget"
+    digits_key = f"{key}_digits"
     display_key = f"{key}_display"
+    value_key = f"{key}_valor"
+    valid_key = f"{key}_valido"
     sync_key = f"{key}_sync_pending"
 
-    if st.session_state.get(sync_key, False) or widget_key not in st.session_state:
-        st.session_state[widget_key] = st.session_state.get(display_key, "")
-        st.session_state[sync_key] = False
+    digits = re.sub(r"\D", "", str(st.session_state.get(digits_key, ""))).lstrip("0")
+    display_value = format_atm_digits(digits)
+    numeric_value = (int(digits) / 100) if digits else 0.0
+
+    st.session_state[digits_key] = digits
+    st.session_state[display_key] = display_value
+    st.session_state[value_key] = numeric_value
+    st.session_state[valid_key] = True
+
+    if widget_key not in st.session_state or st.session_state.get(sync_key, False):
+        st.session_state[widget_key] = display_value
+    st.session_state[sync_key] = False
 
 
 def reconcile_atm_input(key: str, raw_value: str) -> tuple[float, bool]:
@@ -575,17 +596,8 @@ def reconcile_atm_input(key: str, raw_value: str) -> tuple[float, bool]:
     valid_key = f"{key}_valido"
     sync_key = f"{key}_sync_pending"
 
-    previous_display = str(st.session_state.get(display_key, ""))
-    previous_digits = str(st.session_state.get(digits_key, ""))
     current_input = str(raw_value or "")
-    current_digits = re.sub(r"\D", "", current_input)
-
-    if not current_input.strip():
-        new_digits = ""
-    elif len(current_input) < len(previous_display) and previous_display.startswith(current_input):
-        new_digits = previous_digits[:-1]
-    else:
-        new_digits = current_digits.lstrip("0")
+    new_digits = re.sub(r"\D", "", current_input).lstrip("0")
 
     display_value = format_atm_digits(new_digits)
     numeric_value = (int(new_digits) / 100) if new_digits else 0.0
@@ -596,8 +608,7 @@ def reconcile_atm_input(key: str, raw_value: str) -> tuple[float, bool]:
     st.session_state[valid_key] = True
 
     needs_sync = current_input != display_value
-    if needs_sync:
-        st.session_state[sync_key] = True
+    st.session_state[sync_key] = needs_sync
 
     return numeric_value, needs_sync
 
@@ -680,16 +691,16 @@ def atm_input(key: str) -> float:
         placeholder="0,00",
         label_visibility="collapsed",
     )
-    value, needs_sync = reconcile_atm_input(key, raw_value)
-    if needs_sync:
-        return value
+    value, _ = reconcile_atm_input(key, raw_value)
     return value
 
 
 def load_firebase_service_account() -> dict:
+    secret_name = "st.secrets['firebase_service_account']"
     if "firebase_service_account" not in st.secrets:
         raise RuntimeError(
-            "Credenciais do Firebase nao encontradas em st.secrets['firebase_service_account']."
+            "Credenciais do Firebase nao encontradas em "
+            f"{secret_name}. Configure a secao [firebase_service_account] nas Secrets do Streamlit Cloud."
         )
 
     raw_data = dict(st.secrets["firebase_service_account"])
@@ -706,14 +717,27 @@ def load_firebase_service_account() -> dict:
     if missing_fields:
         missing = ", ".join(missing_fields)
         raise RuntimeError(
-            f"Campos obrigatorios ausentes em st.secrets['firebase_service_account']: {missing}."
+            f"Credenciais Firebase incompletas em {secret_name}. "
+            f"Campos obrigatorios ausentes: {missing}."
+        )
+
+    if data["type"] != "service_account":
+        raise RuntimeError(
+            f"Credenciais Firebase invalidas em {secret_name}. "
+            "O campo 'type' deve ser 'service_account'."
+        )
+
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.iam\.gserviceaccount\.com", data["client_email"]):
+        raise RuntimeError(
+            f"Credenciais Firebase invalidas em {secret_name}. "
+            "O campo 'client_email' nao corresponde a um e-mail valido de service account."
         )
 
     private_key = data["private_key"].replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n").strip()
     if "-----BEGIN PRIVATE KEY-----" not in private_key or "-----END PRIVATE KEY-----" not in private_key:
         raise RuntimeError(
-            "O campo 'private_key' em st.secrets['firebase_service_account'] esta mal formatado. "
-            "Ele precisa conter BEGIN PRIVATE KEY e END PRIVATE KEY."
+            f"Credenciais Firebase invalidas em {secret_name}. "
+            "O campo 'private_key' precisa conter BEGIN PRIVATE KEY e END PRIVATE KEY."
         )
 
     data["private_key"] = private_key
@@ -727,8 +751,9 @@ def get_firebase_credentials():
         raise
     except Exception as error:
         raise RuntimeError(
-            "Nao foi possivel validar as credenciais do Firebase em "
-            "st.secrets['firebase_service_account']. "
+            "Credenciais Firebase invalidas na secao [firebase_service_account] do Streamlit Cloud. "
+            "Revise project_id, private_key_id, private_key e client_email para garantir que pertencem "
+            "a mesma service account. "
             f"Detalhe tecnico: {error}"
         ) from error
 
@@ -929,15 +954,31 @@ def load_data_safe() -> tuple[list[dict], list[dict], str | None]:
     recorrentes: list[dict] = []
     errors = []
 
+    def build_firestore_error(error: Exception) -> str:
+        error_text = str(error)
+        if "Invalid JWT Signature" in error_text or "invalid_grant" in error_text:
+            return (
+                "credenciais Firebase invalidas na secao [firebase_service_account] do Streamlit Cloud. "
+                "Revise project_id, private_key_id, private_key e client_email para garantir que pertencem "
+                f"a mesma service account. Detalhe tecnico: {error}"
+            )
+        if "Getting metadata" in error_text or "503" in error_text:
+            return (
+                "falha de autenticacao com o Firebase usando as Secrets do Streamlit Cloud. "
+                "Revise a service account configurada em [firebase_service_account]. "
+                f"Detalhe tecnico: {error}"
+            )
+        return error_text
+
     try:
         data = carregar_dados_firestore()
     except Exception as error:
-        errors.append(f"Erro ao carregar lancamentos: {error}")
+        errors.append(f"Erro ao carregar lancamentos: {build_firestore_error(error)}")
 
     try:
         recorrentes = carregar_recorrentes_firestore()
     except Exception as error:
-        errors.append(f"Erro ao carregar recorrentes: {error}")
+        errors.append(f"Erro ao carregar recorrentes: {build_firestore_error(error)}")
 
     if errors:
         return data, recorrentes, " | ".join(errors)
