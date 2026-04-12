@@ -1508,7 +1508,7 @@ def main() -> None:
     init_state()
     render_header()
 
-    data, recorrentes, firestore_error = load_data_safe()
+    data, recorrentes, firestore_error = [], [], None
     projection_horizon = resolve_projection_horizon(data, recorrentes)
     expanded_data = data + expand_recurring_records(recorrentes, projection_horizon)
     df = prepare_df(expanded_data)
