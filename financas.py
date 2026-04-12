@@ -1593,8 +1593,30 @@ def main() -> None:
     inject_css()
     init_state()
     render_header()
+    st.info("VERSAO DIAGNOSTICO 1")
+    data, recorrentes, firestore_error = [], [], None
 
-    data, recorrentes, firestore_error = load_data_safe()
+    if st.button("Testar conexao com Firestore"):
+        try:
+            db = get_firestore()
+            list(db.collection(COLECAO).limit(1).stream())
+            list(db.collection(COLECAO_RECORRENTES).limit(1).stream())
+            st.session_state["firestore_diagnostic_status"] = "success"
+            st.session_state["firestore_diagnostic_message"] = (
+                "Conexao com Firestore OK para as colecoes 'lancamentos' e "
+                "'lancamentos_recorrentes'."
+            )
+        except Exception as error:
+            st.session_state["firestore_diagnostic_status"] = "error"
+            st.session_state["firestore_diagnostic_message"] = str(error)
+
+    diagnostic_status = st.session_state.get("firestore_diagnostic_status")
+    diagnostic_message = st.session_state.get("firestore_diagnostic_message", "")
+    if diagnostic_status == "success" and diagnostic_message:
+        st.success(diagnostic_message)
+    elif diagnostic_status == "error" and diagnostic_message:
+        st.error(diagnostic_message)
+
     projection_horizon = resolve_projection_horizon(data, recorrentes)
     expanded_data = data + expand_recurring_records(recorrentes, projection_horizon)
     df = prepare_df(expanded_data)
