@@ -835,14 +835,8 @@ def normalize_recurring(item: dict) -> dict:
 
 @st.cache_data(show_spinner=False)
 def carregar_dados_firestore() -> list[dict]:
-    docs = get_firestore().collection(COLECAO).stream()
-    data = []
-    for doc in docs:
-        row = doc.to_dict()
-        row["id"] = doc.id
-        data.append(normalize(row))
-    data.sort(key=lambda row: (row["competencia"], row["descricao"], row["id"]))
-    return data
+    return []
+    
 
 
 @st.cache_data(show_spinner=False)
@@ -1508,7 +1502,7 @@ def main() -> None:
     init_state()
     render_header()
 
-    data, recorrentes, firestore_error = carregar_dados_firestore(), [], None
+    data, recorrentes, firestore_error = [], [], None
     projection_horizon = resolve_projection_horizon(data, recorrentes)
     expanded_data = data + expand_recurring_records(recorrentes, projection_horizon)
     df = prepare_df(expanded_data)
