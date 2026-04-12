@@ -671,7 +671,7 @@ def atm_input(key: str) -> float:
     )
     value, needs_sync = reconcile_atm_input(key, raw_value)
     if needs_sync:
-        st.rerun()
+        return value
     return value
 
 
