@@ -1,5 +1,4 @@
 import calendar
-import os
 import re
 from datetime import date, datetime
 from uuid import uuid4
@@ -22,6 +21,18 @@ st.set_page_config(
 
 COLECAO = "lancamentos"
 COLECAO_RECORRENTES = "lancamentos_recorrentes"
+FIREBASE_REQUIRED_FIELDS = (
+    "type",
+    "project_id",
+    "private_key_id",
+    "private_key",
+    "client_email",
+    "client_id",
+    "auth_uri",
+    "token_uri",
+    "auth_provider_x509_cert_url",
+    "client_x509_cert_url",
+)
 RESPONSAVEIS = ["Luiz", "Maria"]
 CATEGORIAS = [
     "Alimentação",
@@ -675,42 +686,63 @@ def atm_input(key: str) -> float:
     return value
 
 
+def load_firebase_service_account() -> dict:
+    if "firebase_service_account" not in st.secrets:
+        raise RuntimeError(
+            "Credenciais do Firebase nao encontradas em st.secrets['firebase_service_account']."
+        )
+
+    raw_data = dict(st.secrets["firebase_service_account"])
+    data = {key: value.strip() if isinstance(value, str) else value for key, value in raw_data.items()}
+    missing_fields = []
+
+    for field in FIREBASE_REQUIRED_FIELDS:
+        value = data.get(field)
+        normalized_value = value.strip() if isinstance(value, str) else str(value).strip() if value is not None else ""
+        if not normalized_value:
+            missing_fields.append(field)
+        data[field] = normalized_value
+
+    if missing_fields:
+        missing = ", ".join(missing_fields)
+        raise RuntimeError(
+            f"Campos obrigatorios ausentes em st.secrets['firebase_service_account']: {missing}."
+        )
+
+    private_key = data["private_key"].replace("\\n", "\n").replace("\r\n", "\n").replace("\r", "\n").strip()
+    if "-----BEGIN PRIVATE KEY-----" not in private_key or "-----END PRIVATE KEY-----" not in private_key:
+        raise RuntimeError(
+            "O campo 'private_key' em st.secrets['firebase_service_account'] esta mal formatado. "
+            "Ele precisa conter BEGIN PRIVATE KEY e END PRIVATE KEY."
+        )
+
+    data["private_key"] = private_key
+    return data
+
+
 def get_firebase_credentials():
-    if "firebase_service_account" in st.secrets:
-        data = dict(st.secrets["firebase_service_account"])
-        if "private_key" in data:
-            data["private_key"] = data["private_key"].replace("\\n", "\n")
-        return credentials.Certificate(data)
-    if "firebase" in st.secrets:
-        data = dict(st.secrets["firebase"])
-        if "private_key" in data:
-            data["private_key"] = data["private_key"].replace("\\n", "\n")
-        return credentials.Certificate(data)
-    json_path = os.getenv("FIREBASE_SERVICE_ACCOUNT_PATH")
-    if json_path and os.path.exists(json_path):
-        return credentials.Certificate(json_path)
-
-    local_json = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".firebase", "chave.json")
-    if os.path.exists(local_json):
-        return credentials.Certificate(local_json)
-
-    raise RuntimeError(
-        "Credenciais do Firebase nao encontradas. Configure st.secrets['firebase_service_account'], "
-        "FIREBASE_SERVICE_ACCOUNT_PATH ou coloque o JSON em .firebase/chave.json."
-    )
-
-
-def initialize_firebase_app() -> None:
     try:
-        firebase_admin.get_app()
-    except ValueError:
-        firebase_admin.initialize_app(get_firebase_credentials())
+        return credentials.Certificate(load_firebase_service_account())
+    except RuntimeError:
+        raise
+    except Exception as error:
+        raise RuntimeError(
+            "Nao foi possivel validar as credenciais do Firebase em "
+            "st.secrets['firebase_service_account']. "
+            f"Detalhe tecnico: {error}"
+        ) from error
+
+
+def initialize_firebase_app():
+    if not firebase_admin._apps:
+        return firebase_admin.initialize_app(get_firebase_credentials())
+    return firebase_admin.get_app()
 
 
 @st.cache_resource(show_spinner=False)
 def get_firestore():
-    initialize_firebase_app()
-    return firestore.client()
+    app = initialize_firebase_app()
+    return firestore.client(app=app)
 
 
 def is_credit_payment(payment_method: str) -> bool:
@@ -835,8 +867,14 @@ def normalize_recurring(item: dict) -> dict:
 
 @st.cache_data(show_spinner=False)
 def carregar_dados_firestore() -> list[dict]:
-    return []
-    
+    docs = get_firestore().collection(COLECAO).stream()
+    data = []
+    for doc in docs:
+        row = doc.to_dict() or {}
+        row["id"] = row.get("id") or doc.id
+        data.append(normalize(row))
+    return data
+
 
 
 @st.cache_data(show_spinner=False)
@@ -844,8 +882,8 @@ def carregar_recorrentes_firestore() -> list[dict]:
     docs = get_firestore().collection(COLECAO_RECORRENTES).stream()
     data = []
     for doc in docs:
-        row = doc.to_dict()
-        row["id"] = doc.id
+        row = doc.to_dict() or {}
+        row["id"] = row.get("id") or doc.id
         data.append(normalize_recurring(row))
     data.sort(key=lambda row: (row["ativo"] is False, row["descricao"], row["id"]))
     return data
@@ -887,10 +925,23 @@ def desativar_recorrente_firestore(recorrente_id: str, stop_month: str | None = 
 
 
 def load_data_safe() -> tuple[list[dict], list[dict], str | None]:
+    data: list[dict] = []
+    recorrentes: list[dict] = []
+    errors = []
+
     try:
-        return carregar_dados_firestore(), carregar_recorrentes_firestore(), None
+        data = carregar_dados_firestore()
     except Exception as error:
-        return [], [], str(error)
+        errors.append(f"Erro ao carregar lancamentos: {error}")
+
+    try:
+        recorrentes = carregar_recorrentes_firestore()
+    except Exception as error:
+        errors.append(f"Erro ao carregar recorrentes: {error}")
+
+    if errors:
+        return data, recorrentes, " | ".join(errors)
+    return data, recorrentes, None
 
 
 def build_recurring_record(
@@ -1164,7 +1215,7 @@ client_x509_cert_url = "https://www.googleapis.com/robot/v1/metadata/x509/..."
             """.strip(),
             language="toml",
         )
-        st.caption("Tambem funciona com a variavel FIREBASE_SERVICE_ACCOUNT_PATH apontando para o JSON da conta de servico.")
+        st.caption("Use somente a secao [firebase_service_account] nas Secrets do Streamlit Cloud.")
 
 
 def render_header() -> None:
@@ -1502,7 +1553,7 @@ def main() -> None:
     init_state()
     render_header()
 
-    data, recorrentes, firestore_error = [], [], None
+    data, recorrentes, firestore_error = load_data_safe()
     projection_horizon = resolve_projection_horizon(data, recorrentes)
     expanded_data = data + expand_recurring_records(recorrentes, projection_horizon)
     df = prepare_df(expanded_data)
