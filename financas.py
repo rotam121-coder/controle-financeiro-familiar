@@ -1,4 +1,5 @@
 import calendar
+import json
 import re
 from datetime import date, datetime
 from uuid import uuid4
@@ -7,6 +8,7 @@ import altair as alt
 import firebase_admin
 import pandas as pd
 import streamlit as st
+import streamlit.components.v1 as components
 from dateutil.relativedelta import relativedelta
 from firebase_admin import credentials, firestore
 
@@ -564,10 +566,10 @@ def format_atm_digits(digits: str) -> str:
     normalized_digits = re.sub(r"\D", "", str(digits or "")).lstrip("0")
     if not normalized_digits:
         return ""
-    return decimal_brl(int(normalized_digits) / 100)
+    return decimal_brl(round(int(normalized_digits) / 100, 2))
 
 
-def prepare_atm_widget_state(key: str) -> None:
+def sync_atm_value_state(key: str, raw_value: str | None = None, update_widget: bool = True) -> float:
     widget_key = f"{key}_widget"
     digits_key = f"{key}_digits"
     display_key = f"{key}_display"
@@ -575,42 +577,114 @@ def prepare_atm_widget_state(key: str) -> None:
     valid_key = f"{key}_valido"
     sync_key = f"{key}_sync_pending"
 
-    digits = re.sub(r"\D", "", str(st.session_state.get(digits_key, ""))).lstrip("0")
+    source_value = raw_value
+    if source_value is None:
+        source_value = st.session_state.get(widget_key, st.session_state.get(display_key, ""))
+
+    digits = re.sub(r"\D", "", str(source_value or "")).lstrip("0")
     display_value = format_atm_digits(digits)
-    numeric_value = (int(digits) / 100) if digits else 0.0
+    numeric_value = round(int(digits) / 100, 2) if digits else 0.0
 
     st.session_state[digits_key] = digits
     st.session_state[display_key] = display_value
     st.session_state[value_key] = numeric_value
     st.session_state[valid_key] = True
-
-    if widget_key not in st.session_state or st.session_state.get(sync_key, False):
-        st.session_state[widget_key] = display_value
     st.session_state[sync_key] = False
 
+    if update_widget:
+        st.session_state[widget_key] = display_value
+    return numeric_value
 
-def reconcile_atm_input(key: str, raw_value: str) -> tuple[float, bool]:
-    digits_key = f"{key}_digits"
-    display_key = f"{key}_display"
-    value_key = f"{key}_valor"
-    valid_key = f"{key}_valido"
-    sync_key = f"{key}_sync_pending"
 
-    current_input = str(raw_value or "")
-    new_digits = re.sub(r"\D", "", current_input).lstrip("0")
+def inject_atm_input_behavior(key: str) -> None:
+    widget_key = f"{key}_widget"
+    initial_value = st.session_state.get(widget_key, "")
 
-    display_value = format_atm_digits(new_digits)
-    numeric_value = (int(new_digits) / 100) if new_digits else 0.0
+    components.html(
+        f"""
+        <!DOCTYPE html>
+        <html>
+        <body style="margin:0;padding:0;"></body>
+        <script>
+        const widgetKey = {json.dumps(widget_key)};
+        const selector = "input[aria-label='Valor']";
+        const initialValue = {json.dumps(initial_value)};
 
-    st.session_state[digits_key] = new_digits
-    st.session_state[display_key] = display_value
-    st.session_state[value_key] = numeric_value
-    st.session_state[valid_key] = True
+        const getParentInputSetter = () =>
+          Object.getOwnPropertyDescriptor(window.parent.HTMLInputElement.prototype, "value").set;
 
-    needs_sync = current_input != display_value
-    st.session_state[sync_key] = needs_sync
+        const formatDigits = (rawValue) => {{
+          const digits = String(rawValue || "").replace(/\\D/g, "").replace(/^0+(?=\\d)/, "");
+          if (!digits) return "";
+          return new Intl.NumberFormat("pt-BR", {{
+            minimumFractionDigits: 2,
+            maximumFractionDigits: 2,
+          }}).format(Number(digits) / 100);
+        }};
 
-    return numeric_value, needs_sync
+        const moveCaretToEnd = (input) => {{
+          const length = input.value.length;
+          input.setSelectionRange(length, length);
+        }};
+
+        const applyFormattedValue = (input, rawValue) => {{
+          const formatted = formatDigits(rawValue);
+          if (input.value === formatted) {{
+            window.requestAnimationFrame(() => moveCaretToEnd(input));
+            return;
+          }}
+
+          input.dataset.moneyMaskInternal = "true";
+          getParentInputSetter().call(input, formatted);
+          input.dispatchEvent(new Event("input", {{ bubbles: true }}));
+          input.dataset.moneyMaskInternal = "false";
+          window.requestAnimationFrame(() => moveCaretToEnd(input));
+        }};
+
+        const bindMask = () => {{
+          const input = window.parent.document.querySelector(selector);
+          if (!input) return false;
+
+          input.inputMode = "numeric";
+          input.autocomplete = "off";
+          input.spellcheck = false;
+          input.style.textAlign = "right";
+
+          if (input.dataset.moneyMaskBound !== widgetKey) {{
+            input.dataset.moneyMaskBound = widgetKey;
+
+            input.addEventListener("input", () => {{
+              if (input.dataset.moneyMaskInternal === "true") return;
+              applyFormattedValue(input, input.value);
+            }});
+
+            input.addEventListener("paste", () => {{
+              window.setTimeout(() => applyFormattedValue(input, input.value), 0);
+            }});
+
+            input.addEventListener("focus", () => {{
+              window.requestAnimationFrame(() => moveCaretToEnd(input));
+            }});
+
+            input.addEventListener("click", () => {{
+              window.requestAnimationFrame(() => moveCaretToEnd(input));
+            }});
+          }}
+
+          applyFormattedValue(input, input.value || initialValue);
+          return true;
+        }};
+
+        const timer = window.setInterval(() => {{
+          if (bindMask()) window.clearInterval(timer);
+        }}, 60);
+
+        window.setTimeout(() => window.clearInterval(timer), 4000);
+        </script>
+        </html>
+        """,
+        height=0,
+    )
 
 
 def month_label(month_key: str) -> str:
@@ -684,14 +758,15 @@ def note(title: str, body: str, tone: str = "") -> None:
 
 def atm_input(key: str) -> float:
     widget_key = f"{key}_widget"
-    prepare_atm_widget_state(key)
+    sync_atm_value_state(key)
     raw_value = st.text_input(
         "Valor",
         key=widget_key,
         placeholder="0,00",
         label_visibility="collapsed",
     )
-    value, _ = reconcile_atm_input(key, raw_value)
+    value = sync_atm_value_state(key, raw_value=raw_value, update_widget=False)
+    inject_atm_input_behavior(key)
     return value
 
 
