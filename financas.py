@@ -9,8 +9,6 @@ import pandas as pd
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 from firebase_admin import credentials, firestore
-from google.auth.transport.requests import Request
-from google.oauth2 import service_account
 
 
 st.set_page_config(
@@ -760,20 +758,6 @@ def get_firebase_credentials():
         ) from error
 
 
-def test_google_authentication() -> str:
-    service_account_info = load_firebase_service_account()
-    google_credentials = service_account.Credentials.from_service_account_info(
-        service_account_info,
-        scopes=["https://www.googleapis.com/auth/cloud-platform"],
-    )
-    google_credentials.refresh(Request())
-
-    if not google_credentials.token:
-        raise RuntimeError("Token OAuth nao foi retornado apos o refresh das credenciais Google.")
-
-    return "Autenticacao Google OK. Access token OAuth obtido com sucesso."
-
-
 def initialize_firebase_app():
     if not firebase_admin._apps:
         return firebase_admin.initialize_app(get_firebase_credentials())
@@ -906,14 +890,31 @@ def normalize_recurring(item: dict) -> dict:
     }
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=60)
 def carregar_dados_firestore() -> list[dict]:
     docs = get_firestore().collection(COLECAO).stream()
     data = []
     for doc in docs:
         row = doc.to_dict() or {}
         row["id"] = row.get("id") or doc.id
-        data.append(normalize(row))
+        normalized = normalize(row)
+        parsed_purchase_date = pd.to_datetime(normalized.get("data_compra"), errors="coerce")
+        if not pd.isna(parsed_purchase_date):
+            normalized["data_compra"] = parsed_purchase_date.strftime("%Y-%m-%d")
+        normalized["competencia"] = coerce_month_key(normalized.get("competencia")) or coerce_month_key(
+            normalized.get("data_compra")
+        )
+        if not normalized.get("data_compra") and normalized["competencia"]:
+            normalized["data_compra"] = f"{normalized['competencia']}-01"
+        data.append(normalized)
+    data.sort(
+        key=lambda row: (
+            str(row.get("competencia", "")),
+            str(row.get("data_compra", "")),
+            str(row.get("descricao", "")),
+            str(row["id"]),
+        )
+    )
     return data
 
 
@@ -999,6 +1000,40 @@ def load_data_safe() -> tuple[list[dict], list[dict], str | None]:
     if errors:
         return data, recorrentes, " | ".join(errors)
     return data, recorrentes, None
+
+
+def coerce_month_key(value) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, pd.Timestamp):
+        value = value.to_pydatetime()
+    if isinstance(value, datetime):
+        return date_to_month_key(value.date())
+    if isinstance(value, date):
+        return date_to_month_key(value)
+
+    text = str(value).strip()
+    if not text:
+        return ""
+    if re.fullmatch(r"\d{4}-\d{2}", text):
+        return text
+
+    parsed = pd.to_datetime(text, errors="coerce")
+    if pd.isna(parsed):
+        return ""
+    return date_to_month_key(parsed.to_pydatetime().date())
+
+
+def list_dashboard_months(df: pd.DataFrame) -> list[str]:
+    months = {coerce_month_key(value) for value in df["competencia"].tolist()}
+    if not months or months == {""}:
+        months = {coerce_month_key(value) for value in df["data_compra"].tolist()}
+    return sorted((month for month in months if month), reverse=True)
+
+
+def build_period_window_df(df: pd.DataFrame, end_month: str, months_window: int) -> tuple[list[str], pd.DataFrame]:
+    window_months = [shift_month_key(end_month, -offset) for offset in range(months_window - 1, -1, -1)]
+    return window_months, df[df["competencia"].isin(window_months)].copy()
 
 
 def build_recurring_record(
@@ -1408,9 +1443,31 @@ def render_dashboard_tab(df: pd.DataFrame) -> None:
         st.info("Nenhum lancamento encontrado no Firestore ainda.")
         return
 
-    months = sorted(df["competencia"].dropna().unique(), reverse=True)
-    selected_month = st.selectbox("Mes de analise", months, format_func=month_label)
+    months = list_dashboard_months(df)
+    if not months:
+        st.info("Os lancamentos foram carregados, mas nenhum possui competencia valida para o painel.")
+        return
+
+    period_options = {
+        "3 meses": 3,
+        "6 meses": 6,
+        "9 meses": 9,
+        "12 meses": 12,
+    }
+
+    selector_col, period_col = st.columns(2, gap="large")
+    with selector_col:
+        selected_month = st.selectbox("Mes de analise", months, format_func=month_label, key="dashboard_selected_month")
+    with period_col:
+        selected_period_label = st.selectbox(
+            "Resumo consolidado",
+            list(period_options.keys()),
+            key="dashboard_selected_period",
+        )
+
+    selected_period_months = period_options[selected_period_label]
     df_month = df[df["competencia"] == selected_month].copy()
+    period_months, df_period = build_period_window_df(df, selected_month, selected_period_months)
 
     initial_income = float(st.session_state["receitas_mensais"].get(selected_month, 0.0))
     income = st.number_input(
@@ -1430,6 +1487,18 @@ def render_dashboard_tab(df: pd.DataFrame) -> None:
     metric_card(col1, "Gasto do mes", brl(spent), f"Competencia {month_label(selected_month)}", "accent")
     metric_card(col2, "Receita informada", brl(income), "Valor mantido em session_state", "success")
     metric_card(col3, "Saldo projetado", brl(balance), f"Ticket medio {brl(average_ticket)}", "success" if balance >= 0 else "danger")
+
+    period_total = float(df_period["valor"].sum()) if not df_period.empty else 0.0
+    period_average = period_total / selected_period_months if selected_period_months else 0.0
+    period_records = int(len(df_period))
+    period_start = month_label(period_months[0])
+    period_end = month_label(period_months[-1])
+
+    st.markdown("### Resumo consolidado")
+    period_col1, period_col2, period_col3 = st.columns(3, gap="large")
+    metric_card(period_col1, "Gasto no periodo", brl(period_total), f"{period_start} a {period_end}", "accent")
+    metric_card(period_col2, "Media mensal", brl(period_average), f"Janela de {selected_period_months} meses", "success")
+    metric_card(period_col3, "Lancamentos no periodo", str(period_records), selected_period_label, "success")
 
     if income > 0 and spent >= income * 0.8:
         percent = (spent / income) * 100
@@ -1609,44 +1678,7 @@ def main() -> None:
     inject_css()
     init_state()
     render_header()
-    st.info("VERSAO DIAGNOSTICO 1")
-    data, recorrentes, firestore_error = [], [], None
-
-    if st.button("Testar autenticacao Google"):
-        try:
-            st.session_state["google_auth_diagnostic_status"] = "success"
-            st.session_state["google_auth_diagnostic_message"] = test_google_authentication()
-        except Exception as error:
-            st.session_state["google_auth_diagnostic_status"] = "error"
-            st.session_state["google_auth_diagnostic_message"] = str(error)
-
-    if st.button("Testar conexao com Firestore"):
-        try:
-            db = get_firestore()
-            list(db.collection(COLECAO).limit(1).stream())
-            list(db.collection(COLECAO_RECORRENTES).limit(1).stream())
-            st.session_state["firestore_diagnostic_status"] = "success"
-            st.session_state["firestore_diagnostic_message"] = (
-                "Conexao com Firestore OK para as colecoes 'lancamentos' e "
-                "'lancamentos_recorrentes'."
-            )
-        except Exception as error:
-            st.session_state["firestore_diagnostic_status"] = "error"
-            st.session_state["firestore_diagnostic_message"] = str(error)
-
-    google_auth_status = st.session_state.get("google_auth_diagnostic_status")
-    google_auth_message = st.session_state.get("google_auth_diagnostic_message", "")
-    if google_auth_status == "success" and google_auth_message:
-        st.success(google_auth_message)
-    elif google_auth_status == "error" and google_auth_message:
-        st.error(google_auth_message)
-
-    diagnostic_status = st.session_state.get("firestore_diagnostic_status")
-    diagnostic_message = st.session_state.get("firestore_diagnostic_message", "")
-    if diagnostic_status == "success" and diagnostic_message:
-        st.success(diagnostic_message)
-    elif diagnostic_status == "error" and diagnostic_message:
-        st.error(diagnostic_message)
+    data, recorrentes, firestore_error = load_data_safe()
 
     projection_horizon = resolve_projection_horizon(data, recorrentes)
     expanded_data = data + expand_recurring_records(recorrentes, projection_horizon)
