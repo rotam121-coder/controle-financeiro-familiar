@@ -9,6 +9,8 @@ import pandas as pd
 import streamlit as st
 from dateutil.relativedelta import relativedelta
 from firebase_admin import credentials, firestore
+from google.auth.transport.requests import Request
+from google.oauth2 import service_account
 
 
 st.set_page_config(
@@ -756,6 +758,20 @@ def get_firebase_credentials():
             "a mesma service account. "
             f"Detalhe tecnico: {error}"
         ) from error
+
+
+def test_google_authentication() -> str:
+    service_account_info = load_firebase_service_account()
+    google_credentials = service_account.Credentials.from_service_account_info(
+        service_account_info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    google_credentials.refresh(Request())
+
+    if not google_credentials.token:
+        raise RuntimeError("Token OAuth nao foi retornado apos o refresh das credenciais Google.")
+
+    return "Autenticacao Google OK. Access token OAuth obtido com sucesso."
 
 
 def initialize_firebase_app():
@@ -1596,6 +1612,14 @@ def main() -> None:
     st.info("VERSAO DIAGNOSTICO 1")
     data, recorrentes, firestore_error = [], [], None
 
+    if st.button("Testar autenticacao Google"):
+        try:
+            st.session_state["google_auth_diagnostic_status"] = "success"
+            st.session_state["google_auth_diagnostic_message"] = test_google_authentication()
+        except Exception as error:
+            st.session_state["google_auth_diagnostic_status"] = "error"
+            st.session_state["google_auth_diagnostic_message"] = str(error)
+
     if st.button("Testar conexao com Firestore"):
         try:
             db = get_firestore()
@@ -1609,6 +1633,13 @@ def main() -> None:
         except Exception as error:
             st.session_state["firestore_diagnostic_status"] = "error"
             st.session_state["firestore_diagnostic_message"] = str(error)
+
+    google_auth_status = st.session_state.get("google_auth_diagnostic_status")
+    google_auth_message = st.session_state.get("google_auth_diagnostic_message", "")
+    if google_auth_status == "success" and google_auth_message:
+        st.success(google_auth_message)
+    elif google_auth_status == "error" and google_auth_message:
+        st.error(google_auth_message)
 
     diagnostic_status = st.session_state.get("firestore_diagnostic_status")
     diagnostic_message = st.session_state.get("firestore_diagnostic_message", "")
